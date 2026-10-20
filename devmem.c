@@ -154,7 +154,7 @@ static int udmabuf_check_size(size_t size_mb)
 	return ret;
 }
 
-static struct memory_buffer *udmabuf_alloc(size_t size, __u32 rx_page_size)
+static struct memory_buffer *udmabuf_alloc(size_t size, __u32 page_size)
 {
 	unsigned int memfd_flags = MFD_ALLOW_SEALING;
 	long page_sz = sysconf(_SC_PAGESIZE);
@@ -178,7 +178,7 @@ static struct memory_buffer *udmabuf_alloc(size_t size, __u32 rx_page_size)
 		goto free_mem;
 	}
 
-	if (rx_page_size && (long)rx_page_size > page_sz)
+	if (page_size && (long)page_size > page_sz)
 		memfd_flags |= MFD_HUGETLB | MFD_HUGE_2MB;
 
 	mem->memfd = memfd_create("udmabuf-test", memfd_flags);
@@ -343,7 +343,7 @@ static int cuda_dev_init(struct pci_dev *dev)
 	return 0;
 }
 
-static struct memory_buffer *cuda_alloc(size_t size, __u32 rx_page_size __attribute__((unused)))
+static struct memory_buffer *cuda_alloc(size_t size, __u32 hint __attribute__((unused)))
 {
 	struct memory_buffer *mem;
 	size_t page_size;
@@ -758,7 +758,12 @@ int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_ty
 	if (txmp->dev_init && txmp->dev_init(&devmem->tx_dev) < 0)
 		return -1;
 
-	devmem->tx_mem = txmp->alloc(devmem->dmabuf_tx_size_mb * 1024 * 1024, 0);
+	devmem->tx_mem = txmp->alloc(devmem->dmabuf_tx_size_mb * 1024 * 1024,
+				     HUGEPAGE_2MB);
+	if (!devmem->tx_mem) {
+		warnx("No hugepages for the devmem tx buffer, using regular pages");
+		devmem->tx_mem = txmp->alloc(devmem->dmabuf_tx_size_mb * 1024 * 1024, 0);
+	}
 	if (!devmem->tx_mem) {
 		warnx("Failed to allocate devmem tx buffer");
 		return -1;
