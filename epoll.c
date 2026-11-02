@@ -159,6 +159,20 @@ ep_send_disarm(struct worker_state *self, struct worker_connection *conn,
 }
 
 static void
+ep_recv_park(struct worker_state *self, struct worker_connection *conn,
+	     bool park)
+{
+	struct epoll_event ev = {};
+
+	ev.events = park ? 0 : EPOLLIN;
+	ev.data.fd = conn->fd;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_MOD, conn->fd, &ev) < 0)
+		warn("Failed to modify poll in");
+	conn->rx_parked = park;
+}
+
+/* 1: reaped one, 0: none queued, -1: the connection was killed */
+static int
 ep_handle_completions(struct worker_state *self, struct worker_connection *conn,
 		      unsigned int events)
 {
@@ -174,7 +188,7 @@ ep_handle_completions(struct worker_state *self, struct worker_connection *conn,
 	ret = recvmsg(conn->fd, &msg, MSG_ERRQUEUE);
 	if (ret < 0) {
 		if (errno == EAGAIN)
-			return;
+			return 0;
 		warn("failed to clean completions");
 		goto kill_conn;
 	}
@@ -218,17 +232,31 @@ ep_handle_completions(struct worker_state *self, struct worker_connection *conn,
 	kpm_dbg("send complete (%d..%d) %d\n",
 		serr->ee_data, serr->ee_info + 1, conn->to_send_comp);
 
-	return;
+	return 1;
 
 kill_conn:
 	worker_kill_conn(self, conn);
+	return -1;
+}
+
+static bool
+ep_reap_completions(struct worker_state *self, struct worker_connection *conn,
+		    unsigned int events)
+{
+	int ret;
+
+	while ((ret = ep_handle_completions(self, conn, events)) > 0)
+		;
+	return !ret;
 }
 
 static bool
 ep_handle_send(struct worker_state *self, struct worker_connection *conn,
 	       unsigned int events)
 {
-	unsigned int rep = max_t(int, 10, conn->to_send / conn->write_size + 1);
+	/* An open loop backlog sent all at once would starve the rest */
+	unsigned int rep = worker_rr_open_loop(conn) ? 10 :
+		max_t(int, 10, conn->to_send / conn->write_size + 1);
 	bool msg_zerocopy = self->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY || self->opts.tx_mode == KPM_TX_MODE_DEVMEM;
 	int flags = msg_zerocopy ? MSG_ZEROCOPY : 0;
 
@@ -258,6 +286,16 @@ ep_handle_send(struct worker_state *self, struct worker_connection *conn,
 				ep_send_arm(self, conn, events);
 				return true;
 			}
+			/* Open loop sends requests without waiting for the
+			 * responses, and their zerocopy completions can use up
+			 * the socket's memory for them: reap them, try again.
+			 */
+			if (errno == ENOBUFS && msg_zerocopy) {
+				if (!ep_reap_completions(self, conn, events))
+					return false;
+				ep_send_arm(self, conn, events);
+				return true;
+			}
 			warn("Send failed");
 			worker_kill_conn(self, conn);
 			return false;
@@ -271,10 +309,13 @@ ep_handle_send(struct worker_state *self, struct worker_connection *conn,
 				conn->to_send_comp);
 		}
 
-		if (!conn->to_send && !conn->to_send_comp) {
+		if (!conn->to_send) {
 			ep_send_disarm(self, conn, events);
-			worker_send_finished(self, conn);
-			break;
+			if (conn->to_send_comp)
+				conn->compl_wait = true;
+			else
+				worker_send_finished(self, conn);
+			return true;
 		}
 
 		if (n != (ssize_t)chunk) {
@@ -284,7 +325,14 @@ ep_handle_send(struct worker_state *self, struct worker_connection *conn,
 		}
 	}
 
+	ep_send_arm(self, conn, events);
 	return true;
+}
+
+static bool
+ep_start_send(struct worker_state *self, struct worker_connection *conn)
+{
+	return ep_handle_send(self, conn, 0);
 }
 
 static ssize_t
@@ -367,6 +415,9 @@ ep_handle_recv(struct worker_state *self, struct worker_connection *conn)
 		ssize_t n;
 
 		chunk = min_t(size_t, conn->read_size, conn->to_recv);
+		/* Open loop messages are pipelined, read ahead */
+		if (worker_rr_open_loop(conn))
+			chunk = conn->read_size;
 		if (self->opts.rx_mode == KPM_RX_MODE_DEVMEM)
 			n = devmem_recv(conn->fd, &conn->devmem,
 					conn->rxbuf, chunk, self->opts.devmem.mem,
@@ -390,17 +441,14 @@ ep_handle_recv(struct worker_state *self, struct worker_connection *conn)
 			return false;
 		}
 
-		conn->to_recv -= n;
-		conn->tot_recv += n;
-
-		if (!conn->to_recv) {
-			worker_recv_finished(self, conn);
-			if (conn->to_send) {
-				if (!ep_handle_send(self, conn, 0))
-					return false;
-				break;
-			}
+		if (worker_recv_progress(self, conn, n)) {
+			if (!ep_start_send(self, conn))
+				return false;
+			break;
 		}
+		/* Nothing more expected, open loop with none in flight */
+		if (!conn->to_recv)
+			break;
 
 		if (n != conn->read_size)
 			break;
@@ -419,11 +467,21 @@ ep_handle_conn(struct worker_state *self, int fd, unsigned int events)
 	if (!conn)
 		return;
 
+	if (events & EPOLLERR) {
+		if (!ep_reap_completions(self, conn, events))
+			return;
+		if (conn->compl_wait && !conn->to_send_comp) {
+			conn->compl_wait = false;
+			worker_send_finished(self, conn);
+			if (conn->rx_parked)
+				ep_recv_park(self, conn, false);
+		}
+	}
 	if (events & EPOLLOUT) {
 		if (conn->to_send) {
 			if (!ep_handle_send(self, conn, events))
 				return;
-		} else if (!conn->to_send_comp) {
+		} else {
 			ep_send_disarm(self, conn, events);
 		}
 	}
@@ -431,13 +489,14 @@ ep_handle_conn(struct worker_state *self, int fd, unsigned int events)
 		if (conn->to_recv) {
 			if (!ep_handle_recv(self, conn))
 				return;
+		} else if (conn->compl_wait || !self->test) {
+			/* Came before the completions, or after the test */
+			ep_recv_park(self, conn, true);
 		} else if (!warnd_unexpected_pi) {
 			warnx("Unexpected POLLIN %x", events);
 			warnd_unexpected_pi = 1;
 		}
 	}
-	if (events & EPOLLERR)
-		ep_handle_completions(self, conn, events);
 
 	if (!(events & (EPOLLOUT | EPOLLIN | EPOLLERR)))
 		warnx("Connection has nothing to do %x", events);
@@ -458,13 +517,19 @@ static void ep_prep(struct worker_state *self)
 		err(6, "Failed to init epoll");
 }
 
-static void ep_wait(struct worker_state *self, int msec)
+static void ep_wait(struct worker_state *self, __s64 nsec)
 {
+	struct timespec ts, *tsp = NULL;
 	struct epoll_event events[32];
 	int i, nfds;
 
-	nfds = epoll_wait(self->epollfd, events, ARRAY_SIZE(events),
-				msec);
+	if (nsec >= 0) {
+		ts.tv_sec = nsec / 1000000000;
+		ts.tv_nsec = nsec % 1000000000;
+		tsp = &ts;
+	}
+	nfds = epoll_pwait2(self->epollfd, events, ARRAY_SIZE(events),
+			    tsp, NULL);
 	if (nfds < 0)
 		err(7, "Failed to epoll");
 
@@ -488,6 +553,7 @@ static const struct io_ops epoll_io_ops = {
 	.wait		= ep_wait,
 	.conn_add	= ep_conn_add,
 	.conn_close	= ep_conn_close,
+	.kick_send	= ep_start_send,
 	.exit		= ep_exit,
 };
 

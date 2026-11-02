@@ -334,10 +334,6 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 		goto err_close;
 	}
 
-	if (self->tx_mode == KPM_TX_MODE_DEVMEM &&
-	    devmem_bind_socket(&self->devmem, cfd) < 0)
-		goto err_close;
-
 	ret = connect(cfd, (void *)&req->addr, req->len);
 	if (ret < 0) {
 		warn("Failed to connect");
@@ -610,6 +606,8 @@ server_msg_setup_rx_steering(struct session_state *self,
 			     struct kpm_header *hdr)
 {
 	struct kpm_setup_rx_steering *req;
+	struct sockaddr_in6 addr;
+	socklen_t len;
 	int ret;
 
 	if (hdr->len < sizeof(*req)) {
@@ -618,12 +616,21 @@ server_msg_setup_rx_steering(struct session_state *self,
 	}
 	req = (void *)hdr;
 
-	if (!self->tcp_sock) {
-		warnx("RX steering setup requires a TCP acceptor");
+	if (self->tcp_sock) {
+		len = sizeof(addr);
+		if (getsockname(self->tcp_sock, (void *)&addr, &len)) {
+			warn("Failed to query the TCP acceptor's address");
+			goto err_quit;
+		}
+	} else if (req->peer_port) {
+		addr = req->addr;
+	} else {
+		warnx("RX steering setup requires a TCP acceptor, or the peer port");
 		goto err_quit;
 	}
 
-	ret = rx_steering_setup(&self->rx_steering, self->tcp_sock,
+	ret = rx_steering_setup(&self->rx_steering, &addr,
+				self->tcp_sock ? 0 : req->peer_port,
 				req->num_queues);
 	if (ret < 0) {
 		warnx("Failed to setup RX steering");
@@ -653,7 +660,11 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	}
 	req = (void *)hdr;
 
-	if (self->tcp_sock && req->rx_mode == KPM_RX_MODE_DEVMEM) {
+	if (req->rx_mode == KPM_RX_MODE_DEVMEM) {
+		if (!self->rx_steering.configured) {
+			warnx("Devmem RX requires RX steering");
+			goto err_quit;
+		}
 		ret = devmem_setup(&self->devmem, &self->rx_steering,
 				   req->dmabuf_rx_size_mb, req->num_rx_queues,
 				   req->rx_page_size,
@@ -670,7 +681,9 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	self->iou = req->iou;
 	self->iou_state.rx_size_mb = req->iou_rx_size_mb;
 
-	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
+	if (req->tx_mode == KPM_TX_MODE_DEVMEM) {
+		struct connection *conn;
+
 		ret = devmem_setup_tx(&self->devmem, req->tx_provider, req->dmabuf_tx_size_mb,
 				      &req->dev, &req->addr);
 		if (ret < 0) {
@@ -678,6 +691,9 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 			self->quit = 1;
 			return;
 		}
+		list_for_each(&self->connections, conn, connections)
+			if (devmem_bind_socket(&self->devmem, conn->fd) < 0)
+				goto err_quit;
 	}
 
 	if (kpm_reply_empty(self->main_sock, hdr) < 1) {
@@ -1214,9 +1230,9 @@ static void server_session_loop(int fd)
 		free(conn);
 	}
 
-	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
+	if (self.devmem.mem)
 		devmem_teardown(&self.devmem);
-	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)
+	if (self.devmem.tx_mem)
 		devmem_teardown_tx(&self.devmem);
 	rx_steering_teardown(&self.rx_steering);
 

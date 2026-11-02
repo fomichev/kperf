@@ -67,6 +67,36 @@ process), adding threads should not be a problem but was not needed, so far::
                        '---------' |     | '---------'
                                    |     |
 
+Request/response tests
+----------------------
+
+``--req-size`` (and optionally ``--resp-size``) switches from a stream to
+request/response (RR) traffic.  ``--time-stats 1`` adds a latency
+histogram, ``--time-stats 2`` also percentiles and the max.
+
+By default RR is closed loop: one request in flight per connection, the
+next one is sent when the response arrives, so the request rate is as high
+as the round trip allows, and latency is the time between requests.
+
+``--rps <N>`` makes RR open loop: each connection sends a request every
+1/N sec, without waiting for responses.  Latency is measured by the side
+sending requests, from when a request was due to when its response arrived,
+so it includes the time the sender fell behind.  The results show the
+achieved request rate, requests sent and the max number in flight.
+Requests still in flight at the end of the test are not counted.  Open
+loop sets ``TCP_NODELAY``, Nagle would hold requests behind unacked ones.
+TCP autocorking may still delay a request until the previous one left the
+host, set ``net.ipv4.tcp_autocorking=0`` to avoid that.
+
+``--warmup <ms>`` leaves the requests of the first ``<ms>`` of the test out
+of the latencies: they run cold, as the test starts, and the first one of
+open loop is due as soon as the test starts.
+
+With ``--out-csv`` RR tests add the achieved request rate of all
+connections, and open loop also the target, requests sent and the max in
+flight of any connection.  Fields the side receiving requests does not
+measure in open loop are left empty.
+
 Contributing
 ------------
 

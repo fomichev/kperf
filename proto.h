@@ -180,6 +180,10 @@ struct kpm_mode {
 struct kpm_setup_rx_steering {
 	struct kpm_header hdr;
 	__u32 num_queues;
+	/* Connecting side: steer what comes from peer_port (network order) */
+	__u16 peer_port;
+	__u16 pad;
+	struct sockaddr_in6 addr;
 };
 
 enum kpm_tls_mask {
@@ -237,10 +241,19 @@ struct kpm_test {
 				__u32 req_size;
 				__u32 resp_size;
 				__u8 timings;
+				/* Open loop: requests per second, 0 for closed loop */
+				__u32 rps;
+				/* msecs, the requests of the start of the test
+				 * are left out of the latencies
+				 */
+				__u32 warmup_ms;
 			} rr;
 		} arg;
 	} specs[0];
 };
+
+/* The unit of the RR latencies in the results */
+#define KPM_LAT_UNIT_NS		128
 
 struct kpm_test_results {
 	struct kpm_header hdr;
@@ -264,6 +277,9 @@ struct kpm_test_results {
 		__u64 tx_bytes;
 
 		__u32 reqs;
+		/* Open loop only, on the side sending requests */
+		__u32 rr_sent;
+		__u32 rr_inflight_max;
 
 		__u32 retrans;
 		__u32 reord_seen;
@@ -280,6 +296,7 @@ struct kpm_test_results {
 		__u32 p99;
 		__u32 p999;
 		__u32 p9999;
+		__u32 lat_max;
 	} res[0];
 };
 
@@ -348,7 +365,8 @@ int kpm_req_tls(int fd, __u32 conn_id, __u32 dir_mask,
 int kpm_req_pacing(int fd, __u32 conn_id, __u32 max_pace);
 int kpm_req_tcp_cc(int fd, __u32 conn_id, char *cc_name);
 int kpm_req_mode(int fd, struct kpm_mode *mode);
-int kpm_req_setup_rx_steering(int fd, __u32 num_queues);
+int kpm_req_setup_rx_steering(int fd, __u32 num_queues,
+			      const struct sockaddr_in6 *addr, __u16 peer_port);
 int kpm_req_disconnect(int fd, __u32 connection_id);
 
 #endif /* PROTO_H */

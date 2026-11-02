@@ -47,6 +47,8 @@ static struct {
 	unsigned int time_stats;
 	unsigned int req_size;
 	unsigned int resp_size;
+	unsigned int rps;
+	unsigned int warmup_ms;
 	unsigned int read_size;
 	unsigned int write_size;
 	unsigned int pin_off;
@@ -212,6 +214,12 @@ static const struct opt_table opts[] = {
 		     &opt.req_size, "Request size"),
 	OPT_WITH_ARG("--resp-size <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.resp_size, "Response size"),
+	OPT_WITH_ARG("--warmup <ms>", opt_set_uintval, opt_show_uintval,
+		     &opt.warmup_ms,
+		     "Leave the requests of the first <ms> of the test, which run cold as it starts, out of the latencies"),
+	OPT_WITH_ARG("--rps <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.rps,
+		     "Open loop RR: requests per second per connection, 0 for closed loop"),
 	OPT_WITH_ARG("--read-size <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.read_size, "Buffer size for write/send syscall"),
 	OPT_WITH_ARG("--write-size <arg>", opt_set_uintval, opt_show_uintval,
@@ -499,6 +507,11 @@ show_cpu_stat(const char *pfx, struct kpm_test_results *result, unsigned int id)
 	      cpu->sirq / 100.0);
 }
 
+static unsigned long long lat_us(unsigned long long lat)
+{
+	return lat * KPM_LAT_UNIT_NS / 1000;
+}
+
 static void
 dump_result(struct kpm_test_results *result,
 	    struct kpm_connect_reply *conns, bool local)
@@ -546,12 +559,19 @@ dump_result(struct kpm_test_results *result,
 	if (opt.req_size == ~0U)
 		return;
 
-	for (r = 0; r < opt.n_conns; r++)
-		warnx("%.1lf RPS",
-		      (double)result->res[r].reqs /
-		      result->time_usec * 1000000);
+	for (r = 0; r < opt.n_conns; r++) {
+		double rps = result->res[r].reqs * 1000000.0 / result->time_usec;
 
-	if (opt.time_stats < 1)
+		if (opt.rps && local)
+			warnx("%.1lf RPS (target %u, sent %u, max in flight %u)",
+			      rps, opt.rps, result->res[r].rr_sent,
+			      result->res[r].rr_inflight_max);
+		else
+			warnx("%.1lf RPS", rps);
+	}
+
+	/* Open loop latency is measured only by the requesting side */
+	if (opt.time_stats < 1 || (opt.rps && !local))
 		return;
 
 	for (r = 0; r < opt.n_conns; r++) {
@@ -567,13 +587,13 @@ dump_result(struct kpm_test_results *result,
 			const char *unit;
 
 			if (i < 3) {
-				val = 128 << i;
+				val = KPM_LAT_UNIT_NS << i;
 				unit = "ns";
 			} else if (i < 13) {
-				val = (1ULL << (i + 7)) / 1000;
+				val = (1ULL << i) * KPM_LAT_UNIT_NS / 1000;
 				unit = "us";
 			} else {
-				val = (1ULL << (i + 7)) / (1000 * 1000);
+				val = (1ULL << i) * KPM_LAT_UNIT_NS / (1000 * 1000);
 				unit = "ms";
 			}
 			warnx("  [%3d%s] %d",
@@ -585,13 +605,14 @@ dump_result(struct kpm_test_results *result,
 		return;
 
 	for (r = 0; r < opt.n_conns; r++)
-		warnx("p25:%uus p50:%uus p90:%uus p99:%uus p999:%uus p9999:%uus",
-		      result->res[r].p25 * 128 / 1000,
-		      result->res[r].p50 * 128 / 1000,
-		      result->res[r].p90 * 128 / 1000,
-		      result->res[r].p99 * 128 / 1000,
-		      result->res[r].p999 * 128 / 1000,
-		      result->res[r].p9999 * 128 / 1000);
+		warnx("p25:%lluus p50:%lluus p90:%lluus p99:%lluus p999:%lluus p9999:%lluus max:%lluus",
+		      lat_us(result->res[r].p25),
+		      lat_us(result->res[r].p50),
+		      lat_us(result->res[r].p90),
+		      lat_us(result->res[r].p99),
+		      lat_us(result->res[r].p999),
+		      lat_us(result->res[r].p9999),
+		      lat_us(result->res[r].lat_max));
 }
 
 static void
@@ -599,6 +620,8 @@ dump_result_machine(struct kpm_test_results *result,
 		    struct kpm_connect_reply *conns, bool local)
 {
 	struct kpm_test_result res = {};
+	unsigned int inflight_max = 0;
+	bool rr = opt.req_size != ~0U;
 	struct kpm_cpu_load *cpu;
 	unsigned int r;
 	int flow_cpu;
@@ -606,10 +629,13 @@ dump_result_machine(struct kpm_test_results *result,
 	int i;
 
 	for (r = 0; r < opt.n_conns; r++) {
+		inflight_max = max(inflight_max,
+				   result->res[r].rr_inflight_max);
 #define S(f) res.f += result->res[r].f;
 		S(rx_bytes);
 		S(tx_bytes);
 		S(reqs);
+		S(rr_sent);
 		S(retrans);
 		S(reord_seen);
 		S(rtt);
@@ -627,6 +653,7 @@ dump_result_machine(struct kpm_test_results *result,
 		S(p999);
 		S(p9999);
 #undef S
+		res.lat_max = max(res.lat_max, result->res[r].lat_max);
 	}
 	res.rtt /= opt.n_conns;
 	res.rttvar /= opt.n_conns;
@@ -645,7 +672,9 @@ dump_result_machine(struct kpm_test_results *result,
 		for (i = 0; i < 2; i++) {
 			printf("tcp,,,,,,,");
 			if (opt.time_stats >= 2)
-				printf("latency,(us),,,,,");
+				printf("latency,(us),,,,,,");
+			if (rr)
+				printf(opt.rps ? "rr,,,," : "rr,");
 			if (opt.n_conns < 2) {
 				printf("net,,,,");
 				if (opt.pin_off)
@@ -656,7 +685,10 @@ dump_result_machine(struct kpm_test_results *result,
 		for (i = 0; i < 2; i++) {
 			printf("retrans,reord,ce,rtt,rttvar,swnd,cwnd,");
 			if (opt.time_stats >= 2)
-				printf("p25,p50,p90,p99,p999,p9999,");
+				printf("p25,p50,p90,p99,p999,p9999,max,");
+			if (rr)
+				printf(opt.rps ? "rps,target,sent,max_inflight," :
+				       "rps,");
 			if (opt.n_conns < 2) {
 				printf("usr,sys,idle,sirq,");
 				if (opt.pin_off)
@@ -670,11 +702,25 @@ dump_result_machine(struct kpm_test_results *result,
 	       res.retrans, res.reord_seen, res.delivered_ce,
 	       res.rtt, res.rttvar, res.snd_wnd, res.snd_cwnd);
 
-	if (opt.time_stats >= 2)
-		printf("%u,%u,%u,%u,%u,%u,",
-		       res.p25 * 128 / 1000, res.p50 * 128 / 1000,
-		       res.p90 * 128 / 1000, res.p99 * 128 / 1000,
-		       res.p999 * 128 / 1000, res.p9999 * 128 / 1000);
+	/* Open loop latency is measured only by the requesting side */
+	if (opt.time_stats >= 2 && opt.rps && !local)
+		printf(",,,,,,,");
+	else if (opt.time_stats >= 2)
+		printf("%llu,%llu,%llu,%llu,%llu,%llu,%llu,",
+		       lat_us(res.p25), lat_us(res.p50),
+		       lat_us(res.p90), lat_us(res.p99),
+		       lat_us(res.p999), lat_us(res.p9999),
+		       lat_us(res.lat_max));
+
+	if (rr)
+		printf("%.1lf,", res.reqs * 1000000.0 / result->time_usec);
+	if (rr && opt.rps) {
+		printf("%u,", opt.rps * opt.n_conns);
+		if (local)
+			printf("%u,%u,", res.rr_sent, inflight_max);
+		else
+			printf(",,");
+	}
 
 	/* Dunno how to report CPU use, yet */
 	if (opt.n_conns < 2) {
@@ -731,6 +777,7 @@ int main(int argc, char *argv[])
 	__u32 *src_wrk_id, *dst_wrk_id;
 	struct sockaddr_in6 conn_addr;
 	__u32 src_tst_id, dst_tst_id;
+	struct sockaddr_in6 dst_addr;
 	struct sockaddr_in6 src_addr;
 	socklen_t len, src_peer_len;
 	struct addrinfo *addr;
@@ -738,6 +785,7 @@ int main(int argc, char *argv[])
 	unsigned int i;
 	int src, dst;
 	size_t sz;
+	bool rr;
 
 	opt_register_table(opts, NULL);
 
@@ -793,6 +841,9 @@ int main(int argc, char *argv[])
 	else if (opt.devmem_tx)
 		tx_mode = KPM_TX_MODE_DEVMEM;
 
+	if (opt.rps && opt.req_size == ~0U)
+		errx(1, "--rps needs --req-size");
+
 	addr = net_client_lookup(opt.src, opt.src_svc, AF_UNSPEC, SOCK_STREAM);
 	if (!addr)
 		errx(1, "Failed to look up service to connect to");
@@ -835,10 +886,17 @@ int main(int argc, char *argv[])
 		warnx("Failed create TCP acceptor");
 		goto out;
 	}
+	if (sockaddr_to_inet6((void *)&conn_addr, len, &dst_addr) < 0) {
+		warnx("Unsupported TCP acceptor address family");
+		goto out;
+	}
 
+	/* RR uses devmem both ways, a stream from source to destination */
+	rr = opt.req_size != ~0U;
 	struct kpm_mode dst_mode = {
 		.rx_mode = rx_mode,
-		.tx_mode = tx_mode,
+		.tx_mode = tx_mode == KPM_TX_MODE_DEVMEM && !rr ?
+			   KPM_TX_MODE_SOCKET : tx_mode,
 		.rx_provider = opt.devmem_rx_memory,
 		.tx_provider = opt.devmem_tx_memory,
 		.dev = opt.devmem_dst_dev,
@@ -846,12 +904,14 @@ int main(int argc, char *argv[])
 		.dmabuf_tx_size_mb = opt.dmabuf_tx_size_mb,
 		.num_rx_queues = opt.num_rx_queues,
 		.rx_page_size = opt.rx_page_size,
+		.addr = dst_addr,
 		.validate = opt.validate,
 		.iou = opt.iou_dst,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
 	struct kpm_mode src_mode = {
-		.rx_mode = rx_mode,
+		.rx_mode = rx_mode == KPM_RX_MODE_DEVMEM && !rr ?
+			   KPM_RX_MODE_SOCKET : rx_mode,
 		.tx_mode = tx_mode,
 		.rx_provider = opt.devmem_rx_memory,
 		.tx_provider = opt.devmem_tx_memory,
@@ -865,27 +925,34 @@ int main(int argc, char *argv[])
 		.iou = opt.iou_src,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
-	if (kpm_req_mode(src, &src_mode) < 0) {
-		warnx("Failed setup source mode");
-		goto out;
-	}
-
 	/*
-	 * Set up the final destination RSS context before creating connections
-	 * so the bipartite matching observes the CPUs used by the test.
+	 * Set up the final RSS contexts before creating connections so the
+	 * bipartite matching observes the CPUs used by the test.
 	 */
 	if (dst_mode.rx_mode == KPM_RX_MODE_DEVMEM ||
 	    (dst_mode.rx_mode == KPM_RX_MODE_SOCKET_ZEROCOPY && dst_mode.iou)) {
-		if (kpm_req_setup_rx_steering(dst, dst_mode.num_rx_queues) < 0) {
+		if (kpm_req_setup_rx_steering(dst, dst_mode.num_rx_queues,
+					      NULL, 0) < 0) {
 			warnx("Failed to setup destination RX steering");
 			goto out;
 		}
+	}
+	if (src_mode.rx_mode == KPM_RX_MODE_DEVMEM &&
+	    kpm_req_setup_rx_steering(src, src_mode.num_rx_queues, &src_addr,
+				      dst_addr.sin6_port) < 0) {
+		warnx("Failed to setup source RX steering");
+		goto out;
 	}
 
 	conns = spawn_conn(src, dst, &conn_addr, len);
 	if (!conns)
 		goto out;
 
+	/* Bind devmem only after the connections' handshake */
+	if (kpm_req_mode(src, &src_mode) < 0) {
+		warnx("Failed setup source mode");
+		goto out_id;
+	}
 	if (kpm_req_mode(dst, &dst_mode) < 0) {
 		warnx("Failed setup destination mode");
 		goto out_id;
@@ -964,6 +1031,8 @@ int main(int argc, char *argv[])
 			test->specs[i].arg.rr.req_size = opt.req_size;
 			test->specs[i].arg.rr.resp_size = opt.resp_size ?: opt.req_size;
 			test->specs[i].arg.rr.timings = opt.time_stats;
+			test->specs[i].arg.rr.rps = opt.rps;
+			test->specs[i].arg.rr.warmup_ms = opt.warmup_ms;
 		}
 	}
 

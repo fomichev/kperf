@@ -108,6 +108,22 @@ static void iou_conn_add_sendzc(struct io_uring *ring, struct worker_connection 
 	io_uring_sqe_set_data(sqe, tag(conn, IOU_REQ_TYPE_SENDZC));
 }
 
+static void iou_conn_start_send(struct worker_state *self,
+				struct worker_connection *conn)
+{
+	if (self->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY)
+		iou_conn_add_sendzc(get_ring(self), conn);
+	else
+		iou_conn_add_send(get_ring(self), conn);
+}
+
+static bool iou_kick_send(struct worker_state *self,
+			  struct worker_connection *conn)
+{
+	iou_conn_start_send(self, conn);
+	return true;
+}
+
 static void iou_handle_send(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct worker_connection *conn;
@@ -124,7 +140,8 @@ static void iou_handle_send(struct worker_state *self, struct io_uring_cqe *cqe)
 		return;
 	}
 
-	conn->to_send -= n;
+	/* The end of the test may have stopped sending */
+	conn->to_send -= min_t(__u64, n, conn->to_send);
 	conn->tot_sent += n;
 
 	if (!conn->to_send)
@@ -157,7 +174,8 @@ static void iou_handle_sendzc(struct worker_state *self, struct io_uring_cqe *cq
 		return;
 	}
 
-	conn->to_send -= n;
+	/* The end of the test may have stopped sending */
+	conn->to_send -= min_t(__u64, n, conn->to_send);
 	conn->tot_sent += n;
 
 	if (!conn->to_send)
@@ -166,12 +184,17 @@ static void iou_handle_sendzc(struct worker_state *self, struct io_uring_cqe *cq
 		iou_conn_add_sendzc(get_ring(self), conn);
 }
 
-static void iou_conn_add_recv(struct io_uring *ring, struct worker_connection *conn)
+static void iou_conn_add_recv(struct worker_state *self,
+			      struct worker_connection *conn)
 {
 	struct io_uring_sqe *sqe;
+	int flags = 0;
 
-	sqe = io_uring_get_sqe(ring);
-	io_uring_prep_recv(sqe, conn->fd, conn->rxbuf, conn->read_size, 0);
+	if (self->opts.rx_mode == KPM_RX_MODE_SOCKET_TRUNC)
+		flags = MSG_TRUNC;
+
+	sqe = io_uring_get_sqe(get_ring(self));
+	io_uring_prep_recv(sqe, conn->fd, conn->rxbuf, conn->read_size, flags);
 	io_uring_sqe_set_data(sqe, tag(conn, IOU_REQ_TYPE_RECV));
 }
 
@@ -188,7 +211,6 @@ static void iou_conn_add_recvzc(struct io_uring *ring, struct worker_connection 
 
 static void iou_handle_recv(struct worker_state *self, struct io_uring_cqe *cqe)
 {
-	struct io_uring *ring = get_ring(self);
 	struct worker_connection *conn;
 	ssize_t n;
 	void *src;
@@ -211,22 +233,15 @@ static void iou_handle_recv(struct worker_state *self, struct io_uring_cqe *cqe)
 		      conn->tot_recv % PATTERN_PERIOD,
 		      conn->tot_recv);
 
-	conn->to_recv -= n;
-	conn->tot_recv += n;
+	if (worker_recv_progress(self, conn, n))
+		iou_conn_start_send(self, conn);
 
-	if (!conn->to_recv) {
-		worker_recv_finished(self, conn);
-		if (conn->to_send)
-			iou_conn_add_send(ring, conn);
-	}
-
-	iou_conn_add_recv(ring, conn);
+	iou_conn_add_recv(self, conn);
 }
 
 static void iou_handle_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct iou_state *state = get_iou_state(self);
-	struct io_uring *ring = get_ring(self);
 	struct io_uring_zcrx_rq *rq_ring;
 	struct io_uring_zcrx_cqe* rcqe;
 	struct worker_connection *conn;
@@ -267,14 +282,8 @@ static void iou_handle_recvzc(struct worker_state *self, struct io_uring_cqe *cq
 		      conn->tot_recv % PATTERN_PERIOD,
 		      conn->tot_recv);
 
-	conn->to_recv -= n;
-	conn->tot_recv += n;
-
-	if (!conn->to_recv) {
-		worker_recv_finished(self, conn);
-		if (conn->to_send)
-			iou_conn_add_send(ring, conn);
-	}
+	if (worker_recv_progress(self, conn, n))
+		iou_conn_start_send(self, conn);
 
 	rq_ring = &state->rq;
 	rqe = &rq_ring->rqes[rq_ring->rq_tail & state->rq_mask];
@@ -505,18 +514,21 @@ err:
 	return;
 }
 
-static void iou_wait(struct worker_state *self, int msec)
+static void iou_wait(struct worker_state *self, __s64 nsec)
 {
+	struct __kernel_timespec timeout, *tsp = NULL;
 	struct io_uring *ring = get_ring(self);
-	struct __kernel_timespec timeout;
 	struct io_uring_cqe *cqe;
 	unsigned int count = 0;
 	unsigned int head;
 
-	timeout.tv_sec = msec / 1000;
-	timeout.tv_nsec = (msec % 1000) * 1000000;
+	if (nsec >= 0) {
+		timeout.tv_sec = nsec / 1000000000;
+		timeout.tv_nsec = nsec % 1000000000;
+		tsp = &timeout;
+	}
 
-	io_uring_submit_and_wait_timeout(ring, &cqe, 1, &timeout, NULL);
+	io_uring_submit_and_wait_timeout(ring, &cqe, 1, tsp, NULL);
 
 	io_uring_for_each_cqe(ring, head, cqe) {
 		switch (get_tag(cqe->user_data)) {
@@ -553,17 +565,13 @@ static void iou_conn_add(struct worker_state *state, struct worker_connection *c
 {
 	struct io_uring *ring = get_ring(state);
 
-	if (conn->to_send) {
-		if (state->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY)
-			iou_conn_add_sendzc(ring, conn);
-		else
-			iou_conn_add_send(ring, conn);
-	}
+	if (conn->to_send)
+		iou_conn_start_send(state, conn);
 
 	if (state->opts.rx_mode == KPM_RX_MODE_SOCKET_ZEROCOPY)
 		iou_conn_add_recvzc(ring, conn, get_iou_state(state)->zcrx_id);
 	else
-		iou_conn_add_recv(ring, conn);
+		iou_conn_add_recv(state, conn);
 }
 
 static void iou_conn_close(struct worker_state *state, struct worker_connection *conn)
@@ -594,6 +602,7 @@ static const struct io_ops iou_io_ops = {
 	.wait		= iou_wait,
 	.conn_add	= iou_conn_add,
 	.conn_close	= iou_conn_close,
+	.kick_send	= iou_kick_send,
 	.exit		= iou_exit,
 };
 
